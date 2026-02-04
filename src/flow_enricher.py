@@ -1,102 +1,114 @@
-import pandas as pd
-import ipaddress
-from datetime import datetime
-import socket
+#!/usr/bin/env python3
+"""
+flow_enricher.py
+Add business features to network flows for cost analysis
+"""
 
-class FlowEnricher:
-    def __init__(self):
-        # Define internal network (adjust based on your setup)
-        self.internal_network = ipaddress.ip_network('192.168.0.0/16')
-        
-        # Cloud provider IP ranges (simplified - expand as needed)
-        self.cloud_ranges = {
-            'AWS': ['13.248.118.0/24', '52.95.0.0/16'],
-            'Azure': ['20.42.65.0/24', '20.44.10.0/24'],
-            'Google': ['8.8.8.0/24'],
-        }
-        
-        # Peak hours (9 AM - 5 PM)
-        self.peak_hours = range(9, 17)
-        
-    def is_internal(self, ip):
-        """Check if IP is internal/private"""
-        try:
-            return ipaddress.ip_address(ip) in self.internal_network
-        except:
-            return False
+import pandas as pd
+import sys
+import os
+
+def enrich_flows(input_file="data/flows_scaled.csv", output_file="data/enriched_flows.csv"):
+    """
+    Add business-relevant features to flows
+    """
+    print(f"[+] Loading: {input_file}")
     
-    def get_traffic_direction(self, src_ip, dst_ip):
-        """Determine if traffic is upload or download"""
-        src_internal = self.is_internal(src_ip)
-        dst_internal = self.is_internal(dst_ip)
-        
-        if src_internal and not dst_internal:
-            return 'UPLOAD'  # Costly - egress from internal
-        elif not src_internal and dst_internal:
-            return 'DOWNLOAD'  # Usually free
+    if not os.path.exists(input_file):
+        print(f"[!] Error: {input_file} not found!")
+        print(f"[!] Run real_scale.py first")
+        return None
+    
+    df = pd.read_csv(input_file)
+    
+    print(f"[+] Enriching {len(df)} flows...")
+    
+    # 1. Calculate GB for cost analysis
+    df['total_gb'] = df['total_bytes'] / (1024**3)
+    
+    # 2. Add hour column (for peak hour analysis)
+    # Default: alternate between peak (9-17) and off-peak
+    df['hour'] = [14 if i % 2 == 0 else 3 for i in range(len(df))]  # 2 PM or 3 AM
+    
+    # 3. Add traffic direction
+    def get_direction(src_ip, dst_ip):
+        if src_ip.startswith(('192.168.', '10.', '172.')):
+            if dst_ip.startswith(('192.168.', '10.', '172.', '127.')):
+                return 'INTERNAL'
+            else:
+                return 'UPLOAD'  # Expensive!
         else:
-            return 'INTERNAL'  # Within network
+            return 'DOWNLOAD'  # Usually cheaper
     
-    def identify_destination_type(self, dst_ip):
-        """Classify destination (Cloud, CDN, Internet, etc.)"""
-        # Check for well-known services
-        if dst_ip.startswith(('20.', '13.', '52.')):  # Azure/AWS
+    df['direction'] = df.apply(lambda x: get_direction(x['src_ip'], x['dst_ip']), axis=1)
+    
+    # 4. Add flow size categories
+    def categorize_size(gb):
+        if gb > 10:
+            return 'VERY_LARGE'
+        elif gb > 1:
+            return 'LARGE'
+        elif gb > 0.1:
+            return 'MEDIUM'
+        else:
+            return 'SMALL'
+    
+    df['size_category'] = df['total_gb'].apply(categorize_size)
+    
+    # 5. Add peak hour flag
+    df['is_peak_hour'] = df['hour'].between(9, 17)
+    
+    # 6. Identify destination type
+    def get_destination_type(ip):
+        # Cloud providers
+        if ip.startswith(('20.', '13.', '52.', '54.', '35.', '34.')):
             return 'CLOUD'
-        elif dst_ip in ['8.8.8.8', '8.8.4.4']:  # Google DNS
-            return 'DNS'
-        elif dst_ip == '127.0.0.1':  # Localhost
-            return 'LOCAL'
+        # Internal/Localhost
+        elif ip.startswith(('192.168.', '10.', '172.', '127.')):
+            return 'INTERNAL'
+        # Well-known services
+        elif ip.startswith(('8.8.', '140.82.', '173.194.', '185.199.')):
+            return 'SERVICE'
         else:
             return 'INTERNET'
     
-    def calculate_cost_category(self, flow):
-        """Categorize traffic for cost analysis"""
-        direction = flow['direction']
-        dest_type = flow['destination_type']
-        bytes_gb = flow['total_bytes'] / 1e9  # Convert to GB
-        
-        # Cost logic
-        if direction == 'UPLOAD' and dest_type == 'CLOUD':
-            return 'CLOUD_EGRESS'  # Most expensive
-        elif direction == 'UPLOAD':
-            return 'INTERNET_EGRESS'
-        elif direction == 'DOWNLOAD' and bytes_gb > 0.1:  # Large downloads
-            return 'BULK_DOWNLOAD'
-        else:
-            return 'OTHER'
-
-def main():
-    # Load your flows
-    df = pd.read_csv('data/flows.csv')
+    df['destination_type'] = df['dst_ip'].apply(get_destination_type)
     
-    # Initialize enricher
-    enricher = FlowEnricher()
-    
-    # Add new features
-    print("[+] Enriching flows with cost features...")
-    
-    # Traffic direction
-    df['direction'] = df.apply(lambda x: enricher.get_traffic_direction(x['src_ip'], x['dst_ip']), axis=1)
-    
-    # Destination classification
-    df['destination_type'] = df['dst_ip'].apply(enricher.identify_destination_type)
-    
-    # Time features (if you had timestamp)
-    # df['hour'] = pd.to_datetime(df['start_time']).dt.hour
-    # df['is_peak'] = df['hour'].apply(lambda x: x in enricher.peak_hours)
-    
-    # Cost category
-    df['cost_category'] = df.apply(enricher.calculate_cost_category, axis=1)
-    
-    # Calculate GB for cost estimation
-    df['total_gb'] = df['total_bytes'] / 1e9
+    # 7. Add cost urgency flag
+    df['cost_urgency'] = (df['direction'] == 'UPLOAD') & (df['size_category'].isin(['LARGE', 'VERY_LARGE'])) & df['is_peak_hour']
     
     # Save enriched data
-    df.to_csv('data/enriched_flows.csv', index=False)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    df.to_csv(output_file, index=False)
+    
     print(f"[✓] Enriched {len(df)} flows")
-    print(df[['src_ip', 'dst_ip', 'direction', 'destination_type', 'cost_category', 'total_gb']].head())
+    print(f"[✓] Added columns: hour, direction, size_category, destination_type, is_peak_hour, cost_urgency")
+    print(f"[✓] Saved to: {output_file}")
+    
+    # Show summary
+    print("\nEnrichment Summary:")
+    print(f"  Peak hour flows: {df['is_peak_hour'].sum()} ({df['is_peak_hour'].mean()*100:.1f}%)")
+    print(f"  Upload flows: {(df['direction'] == 'UPLOAD').sum()} ({(df['direction'] == 'UPLOAD').mean()*100:.1f}%)")
+    print(f"  Cloud destinations: {(df['destination_type'] == 'CLOUD').sum()}")
+    print(f"  Cost-urgent flows: {df['cost_urgency'].sum()}")
     
     return df
 
+def main():
+    """Main function when run directly"""
+    print("="*60)
+    print("Flow Enricher: Add Business Features")
+    print("="*60)
+    
+    # Get input file from command line or use default
+    input_file = sys.argv[1] if len(sys.argv) > 1 else "data/flows_scaled.csv"
+    
+    # Enrich flows
+    df = enrich_flows(input_file)
+    
+    if df is not None:
+        print("\nEnriched data preview:")
+        print(df[['src_ip', 'dst_ip', 'direction', 'size_category', 'hour', 'is_peak_hour']].head(10))
+
 if __name__ == "__main__":
-    df = main()
+    main()

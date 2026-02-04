@@ -11,3 +11,9 @@ __pycache__/
 
 # Logs
 *.log
+
+# Reports (keep structure but not content)
+reports/*.json
+reports/*.txt
+reports/plots/*
+!reports/.gitkeep
